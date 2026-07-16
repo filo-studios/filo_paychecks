@@ -3,54 +3,70 @@ local frameworkJobs = Framework.GetFrameworkJobs()
 
 local function cachePlayerJobs(source)
     local identifier = Framework.GetPlayerIdentifier(source)
-    local result = MySQL.single.await('SELECT * FROM filo_paychecks USE INDEX (idx_citizenid) WHERE citizenid = ?', { identifier })
+    local result = MySQL.query.await(
+        "SELECT job, minutes, amount, data FROM `filo_paychecks` WHERE citizenid = ?",
+        { identifier }
+    )
 
-    if result then
-        cachedPlayers[identifier] = {
-            jobs = json.decode(result.jobs),
-            paychecks = json.decode(result.paychecks)
-        }
+    cachedPlayers[identifier] = { jobs = {}, paychecks = {} }
+
+    if result and #result > 0 then
+        for _, row in ipairs(result) do
+            local ok, decoded = pcall(json.decode, row.data)
+            if ok and decoded and next(decoded) then
+                cachedPlayers[identifier].jobs[row.job] = decoded
+            end
+            cachedPlayers[identifier].paychecks[row.job] = row.amount
+        end
     else
         local playerJob = Framework.GetPlayerJobData(source)
-        local defaultPaycheck = frameworkJobs[playerJob.jobName].grades[playerJob.gradeRank].payment or 0
+        local frameworkJob = frameworkJobs[playerJob.jobName]
+        if not frameworkJob then return end
+
+        local defaultPaycheck = frameworkJob.grades[playerJob.gradeRank].payment or 0
         local jobData = {
-            [playerJob.jobName] = {
-                jobLabel = frameworkJobs[playerJob.jobName].label,
-                grade = playerJob.gradeRank,
-                gradeLabel = playerJob.gradeLabel,
-                paycheck = defaultPaycheck,
-                offDutyPay = frameworkJobs[playerJob.jobName].offDutyPay or false
-            }
+            jobLabel   = frameworkJob.label,
+            grade      = playerJob.gradeRank,
+            gradeLabel = playerJob.gradeLabel,
+            paycheck   = defaultPaycheck,
+            offDutyPay = frameworkJob.offDutyPay or false,
         }
-        MySQL.insert.await('INSERT INTO filo_paychecks (citizenid, jobs, paychecks) VALUES (?, ?, ?)', { identifier, json.encode(jobData), json.encode({}) })
-        cachedPlayers[identifier] = {
-            jobs = jobData,
-            paychecks = {}
-        }
+
+        MySQL.query(
+            "INSERT INTO `filo_paychecks` (citizenid, job, minutes, amount, data) VALUES (?, ?, 0, 0, ?) ON DUPLICATE KEY UPDATE data = VALUES(data)",
+            { identifier, playerJob.jobName, json.encode(jobData) }
+        )
+
+        cachedPlayers[identifier].jobs[playerJob.jobName] = jobData
+        cachedPlayers[identifier].paychecks[playerJob.jobName] = 0
     end
 end
 
 function AddPaycheck(identifier, job, amount)
     if not cachedPlayers[identifier] then return end
-    if not cachedPlayers[identifier].paychecks[job] then
-        cachedPlayers[identifier].paychecks[job] = 0
-    end
 
-    DebugPrint("Adding paycheck for " .. job .. " for " .. amount .. " to " .. identifier)
-    cachedPlayers[identifier].paychecks[job] += amount
+    cachedPlayers[identifier].paychecks[job] = (cachedPlayers[identifier].paychecks[job] or 0) + amount
+
+    MySQL.query(
+        "INSERT INTO `filo_paychecks` (citizenid, job, minutes, amount, data) VALUES (?, ?, 0, ?, '{}') ON DUPLICATE KEY UPDATE amount = amount + VALUES(amount)",
+        { identifier, job, amount }
+    )
+
+    DebugPrint(("Adding paycheck for %s for %d to %s"):format(job, amount, identifier))
 
     if Config.NotifyOnPaycheck then
         local source = Framework.GetPlayerSource(identifier)
         if not source then return end
 
-        local jobLabel = cachedPlayers[identifier].jobs[job].jobLabel
+        local jobLabel = cachedPlayers[identifier].jobs[job] and cachedPlayers[identifier].jobs[job].jobLabel or job
         if Config.NotifyType == "framework" then
-            Notify.SendNotification(source, "Paycheck Received", "You have received a paycheck of $" .. amount .. " for your work at " .. jobLabel, "info")
+            Notify.SendNotification(source, "Paycheck Received",
+                "You have received a paycheck of $" .. amount .. " for your work at " .. jobLabel, "info")
         elseif Config.NotifyType == "lb-phone" then
             Phone.SendEmail(source,
-                job .. "paychecks@filo.com", -- sender
-                "Payroll Notification: " .. jobLabel, -- subject
-                "You have received a paycheck of $" .. amount .. " for your work at " .. jobLabel -- message
+                job .. "paychecks@filo.com",
+                "Payroll Notification: " .. jobLabel,
+                "You have received a paycheck of $" .. amount .. " for your work at " .. jobLabel
             )
         end
     end
@@ -63,8 +79,6 @@ CreateThread(function()
     end
 
     while true do
-        Wait(60000)
-
         for _, source in pairs(Framework.GetPlayers()) do
             local identifier = Framework.GetPlayerIdentifier(source)
             if not cachedPlayers[identifier] then cachePlayerJobs(source) end
@@ -72,8 +86,9 @@ CreateThread(function()
             local playerJob = Framework.GetPlayerJobData(source)
             if playerJob and playerJob.jobName == 'unemployed' then goto skip end
 
-            local playerMinutes = GetPlayerMinutes(identifier, playerJob.jobName) or 0
-            playerMinutes += 1
+            local accountBalance = Banking.GetAccountMoney(playerJob.jobName) or 0
+            local playerMinutes  = GetPlayerMinutes(identifier, playerJob.jobName) or 0
+            playerMinutes        += 1
 
             if playerMinutes % Config.PaycheckInterval ~= 0 then
                 SetPlayerMinutes(identifier, playerJob.jobName, playerMinutes)
@@ -85,28 +100,50 @@ CreateThread(function()
             local jobData = cachedPlayers[identifier].jobs[playerJob.jobName]
 
             if not jobData then
-                local defaultPaycheck = frameworkJobs[playerJob.jobName].grades[playerJob.gradeRank].payment or 0
-                cachedPlayers[identifier].jobs[playerJob.jobName] = {
-                    jobLabel = frameworkJobs[playerJob.jobName].label,
-                    grade = playerJob.gradeRank,
+                local frameworkJob = frameworkJobs[playerJob.jobName]
+                if not frameworkJob then goto skip end
+
+                local defaultPaycheck = frameworkJob.grades[playerJob.gradeRank].payment or 0
+                jobData = {
+                    jobLabel   = frameworkJob.label,
+                    grade      = playerJob.gradeRank,
                     gradeLabel = playerJob.gradeLabel,
-                    paycheck = defaultPaycheck,
-                    offDutyPay = frameworkJobs[playerJob.jobName].offDutyPay or false
+                    paycheck   = defaultPaycheck,
+                    offDutyPay = frameworkJob.offDutyPay or false,
                 }
-                jobData = cachedPlayers[identifier].jobs[playerJob.jobName]
+                cachedPlayers[identifier].jobs[playerJob.jobName] = jobData
+
+                MySQL.query(
+                    "INSERT INTO `filo_paychecks` (citizenid, job, minutes, amount, data) VALUES (?, ?, 0, 0, ?) ON DUPLICATE KEY UPDATE data = VALUES(data)",
+                    { identifier, playerJob.jobName, json.encode(jobData) }
+                )
             end
+
+            if jobData.deductSocietyMoney and accountBalance < jobData.paycheck then
+                DebugPrint("Society account " .. playerJob.jobName .. " has insufficient funds for " .. identifier)
+                SetPlayerMinutes(identifier, playerJob.jobName, playerMinutes)
+                goto skip
+            end
+
             if jobData.paycheck < 1 then
                 DebugPrint("Paycheck amount is less than 1 for " .. playerJob.jobName .. " for " .. identifier)
                 goto skip
             end
+
             if not jobData.offDutyPay and not playerJob.onDuty then
-                DebugPrint("Off duty pay is disabled and player is not on duty for " .. playerJob.jobName .. " for " .. identifier)
+                DebugPrint("Off duty pay is disabled and player is not on duty for " ..
+                    playerJob.jobName .. " for " .. identifier)
                 goto skip
+            end
+
+            if jobData.deductSocietyMoney then
+                Banking.RemoveAccountMoney(playerJob.jobName, jobData.paycheck)
             end
 
             AddPaycheck(identifier, playerJob.jobName, jobData.paycheck)
             ::skip::
         end
+        Wait(60000)
     end
 end)
 
@@ -127,9 +164,15 @@ end)
 lib.callback.register("filo_paychecks:server:updatePaycheckData", function(source, job, identifier, paycheck, offDutyPay)
     local identifier = identifier or Framework.GetPlayerIdentifier(source)
     if not cachedPlayers[identifier] then return false end
+    if not cachedPlayers[identifier].jobs[job] then return false end
 
-    cachedPlayers[identifier].jobs[job].paycheck = paycheck
+    cachedPlayers[identifier].jobs[job].paycheck   = paycheck
     cachedPlayers[identifier].jobs[job].offDutyPay = offDutyPay
+
+    MySQL.query(
+        "UPDATE `filo_paychecks` SET data = ? WHERE citizenid = ? AND job = ?",
+        { json.encode(cachedPlayers[identifier].jobs[job]), identifier, job }
+    )
 
     return true
 end)
@@ -146,17 +189,28 @@ lib.callback.register("filo_paychecks:server:claimPaycheck", function(source, jo
         return false
     end
 
-    DebugPrint("Added paycheck to player " .. identifier .. " for " .. job)
-    Notify.SendNotification(source, 'Paycheck Claimed', 'You have claimed your paycheck of $' .. paycheck .. '.', 'success')
-
     cachedPlayers[identifier].paychecks[job] = 0
+
+    MySQL.query(
+        "UPDATE `filo_paychecks` SET amount = 0 WHERE citizenid = ? AND job = ?",
+        { identifier, job }
+    )
+
+    DebugPrint("Claimed paycheck for " .. identifier .. " for " .. job)
+    Notify.SendNotification(source, 'Paycheck Claimed', 'You have claimed your paycheck of $' .. paycheck .. '.',
+        'success')
+
     return true
 end)
 
-AddEventHandler("onResourceStop", function(resourceName)
-    if resourceName ~= cache.resource then return end
+AddEventHandler('community_bridge:Server:OnPlayerLoaded', function(source)
+    local identifier = Framework.GetPlayerIdentifier(source)
+    if not identifier then return end
+    if not cachedPlayers[identifier] then cachePlayerJobs(source) end
+end)
 
-    for identifier, data in pairs(cachedPlayers) do
-        MySQL.update.await('UPDATE filo_paychecks SET jobs = ?, paychecks = ? WHERE citizenid = ?', { json.encode(data.jobs), json.encode(data.paychecks), identifier })
-    end
+AddEventHandler('community_bridge:Server:OnPlayerUnload', function(source)
+    local identifier = Framework.GetPlayerIdentifier(source)
+    if not identifier then return end
+    cachedPlayers[identifier] = nil
 end)
