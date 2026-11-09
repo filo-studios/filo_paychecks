@@ -44,3 +44,4 @@ jobs:
           webhook: ${{ secrets.DISCORD_PATCH_NOTES_WEBHOOK }}
           role-id: '1517205170927435958'
           # channel-id: '' # add this script's Discord channel ID
+          name: 'Filo Paychecks'
