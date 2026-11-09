@@ -37,6 +37,7 @@ jobs:
               echo 'NOTES_EOF'
             } >> "$GITHUB_OUTPUT"
           fi
+
       - name: Post patch notes
         if: steps.version.outputs.new == 'true'
         uses: filo-studios/release-notifier@v1
